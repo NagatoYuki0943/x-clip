@@ -5,17 +5,16 @@ from functools import partial, wraps
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as distributed
 from torch import nn, einsum
 from torch.utils.checkpoint import checkpoint
-
-from torch.autograd import Function
-import torch.distributed as distributed
 
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange, Reduce
 
 from x_clip.mlm import MLM
 from x_clip.visual_ssl import SimSiam, SimCLR
+from x_clip.distributed import all_gather
 
 # helper functions
 
@@ -64,60 +63,6 @@ def matrix_diag(t):
     diag_mask = rearrange(i_range, 'i -> i 1') == rearrange(j_range, 'j -> 1 j')
     diag_el = t.masked_select(diag_mask)
     return rearrange(diag_el, '(b d) -> b d', d = num_diag_el)
-
-# distributed helpers
-
-def all_gather_variable_dim(t, dim = 0):
-    device, rank, world_size = t.device, distributed.get_rank(), distributed.get_world_size()
-
-    size = torch.tensor(t.shape[dim], device = device, dtype = torch.long)
-    sizes = [torch.empty_like(size, device = device, dtype = torch.long) for i in range(world_size)]
-    distributed.all_gather(sizes, size)
-
-    sizes = torch.stack(sizes)
-    max_size = sizes.amax().item()
-    padded_t = pad_dim_to(t, max_size, dim = dim)
-
-    gathered_tensors = [torch.empty(padded_t.shape, device = device, dtype = padded_t.dtype) for i in range(world_size)]
-    distributed.all_gather(gathered_tensors, padded_t)
-
-    gathered_tensor = torch.cat(gathered_tensors, dim = dim)
-    seq = torch.arange(max_size, device = device)
-
-    mask = rearrange(seq, 'j -> 1 j') < rearrange(sizes, 'i -> i 1')
-    mask = rearrange(mask, 'i j -> (i j)')
-    seq = torch.arange(mask.shape[-1], device = device)
-    indices = seq[mask]
-
-    gathered_tensor = gathered_tensor.index_select(dim, indices)
-    sizes = sizes.tolist()
-
-    return gathered_tensor, sizes
-
-class MaybeAllGather(Function):
-    @staticmethod
-    def forward(ctx, x, dim):
-        is_distributed = distributed.is_initialized() and distributed.get_world_size() > 1
-        ctx.is_distributed = is_distributed
-        ctx.dim = dim
-
-        if not is_distributed:
-            return x
-
-        x, batch_sizes = all_gather_variable_dim(x, dim = dim)
-        ctx.batch_sizes = batch_sizes
-        return x
-
-    @staticmethod
-    def backward(ctx, grads):
-        if not ctx.is_distributed:
-            return grads, None
-
-        batch_sizes, rank = ctx.batch_sizes, distributed.get_rank()
-        grads_by_rank = grads.split(batch_sizes, dim = ctx.dim)
-        return grads_by_rank[rank], None
-
-maybe_all_gather = MaybeAllGather.apply
 
 # checkpointing helper function
 
@@ -506,6 +451,7 @@ class CLIP(nn.Module):
         image_ssl_loss_weight = 0.05,
         multiview_loss_weight = 0.1,
         checkpoint_during_training = False,
+        sim_reg_loss_weight = 0.,
         **kwargs
     ):
         super().__init__()
@@ -641,6 +587,13 @@ class CLIP(nn.Module):
 
         self.multiview_loss_weight = multiview_loss_weight
 
+        # is distributed or not
+        self.requires_all_gather = distributed.is_initialized() and distributed.get_world_size() > 1
+
+        # use the similarity regularization proposed in https://arxiv.org/abs/2309.08773
+        self.sim_reg_loss_weight = sim_reg_loss_weight
+        self.has_sim_reg_loss = sim_reg_loss_weight > 0.
+
     def forward(
         self,
         text,
@@ -654,7 +607,7 @@ class CLIP(nn.Module):
         aug_text = None,                # augmented text (for multiview)
         aug_image = None                # augmented image (for multiview)
     ):
-        b, device = text.shape[0], text.device
+        batch, device = text.shape[0], text.device
 
         # derive text mask
 
@@ -803,12 +756,32 @@ class CLIP(nn.Module):
 
         # maybe distributed all gather
 
-        text_latents = maybe_all_gather(text_latents, 1)
-        image_latents = maybe_all_gather(image_latents, 1)
+        if self.requires_all_gather:
+            latents = torch.stack((text_latents, image_latents))
+            latents, sizes = all_gather(latents, 2, None)
+            text_latents, image_latents = latents
 
-        if self.extra_latent_projection:
-            text_latents_extra = maybe_all_gather(text_latents_extra, 1)
-            image_latents_extra = maybe_all_gather(image_latents_extra, 1)
+            batch = sizes.sum().item()
+
+            if self.extra_latent_projection:
+                latents_extra = torch.stack((text_latents_extra, image_latents_extra))
+                latents_extra, _ = all_gather(latents_extra, 2, sizes)
+                text_latents_extra, image_latents_extra = latents_extra
+
+        # maybe similarity regularize
+
+        sim_reg_loss = 0.
+
+        if self.has_sim_reg_loss:
+            diag_mask = torch.eye(batch, device = device, dtype = torch.bool)
+            off_diag_mask = rearrange(~diag_mask, '... -> 1 ...')
+
+            text_sim, image_sim, text_extra_sim, image_extra_sim = map(lambda t: einsum('m i ... d, m j ... d -> m ... i j', t, t)[off_diag_mask], (text_latents, image_latents, text_latents_extra, image_latents_extra))
+
+            sim_reg_loss = (
+                F.mse_loss(text_sim, image_sim) +
+                F.mse_loss(text_extra_sim, image_extra_sim)
+            ) / 2
 
         # contrastive loss
 
@@ -859,7 +832,7 @@ class CLIP(nn.Module):
         # denominator
 
         if self.decoupled_contrastive_learning:
-            pos_mask = torch.eye(b, device = device, dtype = torch.bool)
+            pos_mask = torch.eye(batch, device = device, dtype = torch.bool)
             text_to_image_exp, image_to_text_exp = map(lambda t: t.masked_fill(pos_mask, 0.), (text_to_image_exp, image_to_text_exp))
 
         text_to_image_denom, image_to_text_denom = map(lambda t: t.sum(dim = -1), (text_to_image_exp, image_to_text_exp))
@@ -893,5 +866,10 @@ class CLIP(nn.Module):
 
         if is_multiview:
             loss = loss + multiview_cl_loss.mean() * multiview_loss_weight
+
+        # add similarity regularization loss with weight if needed
+
+        if self.has_sim_reg_loss:
+            loss = loss + sim_reg_loss * self.sim_reg_loss_weight
 
         return loss
